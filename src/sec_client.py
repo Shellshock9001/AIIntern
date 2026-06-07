@@ -54,7 +54,28 @@ def _get(url: str, *, cache_key: Optional[str] = None, is_json: bool = True):
             raw = cached.read_text(encoding="utf-8")
             return json.loads(raw) if is_json else raw
     _throttle()
-    resp = requests.get(url, headers=HEADERS, timeout=30)
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            "Could not reach SEC EDGAR (data.sec.gov). Check your internet "
+            "connection. If you're behind a proxy/firewall, allow access to "
+            "*.sec.gov. The numeric data and filings are fetched from there."
+        ) from e
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(
+            "SEC EDGAR request timed out. The service may be busy — wait a moment "
+            "and re-run; previously fetched data is cached locally."
+        ) from e
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "SEC EDGAR returned 403 (blocked). SEC requires a descriptive "
+            "User-Agent with contact info; edit USER_AGENT in src/sec_client.py "
+            "to include your email.")
+    if resp.status_code == 429:
+        raise RuntimeError(
+            "SEC EDGAR rate-limited the request (429). Wait ~30s and re-run — the "
+            "client self-throttles, so this is rare and transient.")
     resp.raise_for_status()
     payload = resp.text
     if cache_key:
@@ -65,8 +86,13 @@ def _get(url: str, *, cache_key: Optional[str] = None, is_json: bool = True):
 # ---------------------------------------------------------------------------
 # Ticker -> CIK resolution
 # ---------------------------------------------------------------------------
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
 def load_ticker_map() -> dict[str, dict]:
-    """Map upper-case ticker -> {cik_str (10-digit zero-padded), title}."""
+    """Map upper-case ticker -> {cik (10-digit), title}. Memoized in-process:
+    parsed once per run, not re-parsed on every resolve_cik call."""
     data = _get(f"{SEC_WWW}/files/company_tickers.json", cache_key="company_tickers.json")
     out = {}
     for row in data.values():
@@ -133,6 +159,7 @@ class Fact:
                 f"&type={self.form}&dateb=&owner=include&count=40")
 
 
+@lru_cache(maxsize=64)
 def get_company_facts(ticker: str) -> dict:
     cik = resolve_cik(ticker)["cik"]
     return _get(
@@ -142,8 +169,12 @@ def get_company_facts(ticker: str) -> dict:
 
 
 # Canonical concept aliases. Companies tag the same economic line differently;
-# we try each alias in order and record which one actually hit.
+# we try each alias in order and record which one actually hit. This registry is
+# intentionally broad — the discovery layer reports which concepts a given filer
+# actually reports, so coverage adapts per company/sector rather than assuming a
+# fixed set. Add more concepts here and the whole pipeline picks them up.
 CONCEPT_ALIASES: dict[str, list[str]] = {
+    # --- Income statement ---
     "Revenue": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
@@ -155,6 +186,16 @@ CONCEPT_ALIASES: dict[str, list[str]] = {
     "OperatingIncome": ["OperatingIncomeLoss"],
     "NetIncome": ["NetIncomeLoss", "ProfitLoss"],
     "ResearchDev": ["ResearchAndDevelopmentExpense"],
+    "SGA": ["SellingGeneralAndAdministrativeExpense",
+            "GeneralAndAdministrativeExpense"],
+    "InterestExpense": ["InterestExpense", "InterestExpenseDebt"],
+    "IncomeTax": ["IncomeTaxExpenseBenefit"],
+    "PretaxIncome": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+                     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
+    "EPS_Diluted": ["EarningsPerShareDiluted"],
+    "EPS_Basic": ["EarningsPerShareBasic"],
+    "DilutedShares": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    # --- Balance sheet ---
     "TotalAssets": ["Assets"],
     "TotalLiabilities": ["Liabilities"],
     "StockholdersEquity": [
@@ -162,13 +203,47 @@ CONCEPT_ALIASES: dict[str, list[str]] = {
         "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
     ],
     "CashAndEquivalents": ["CashAndCashEquivalentsAtCarryingValue"],
+    "CurrentAssets": ["AssetsCurrent"],
+    "CurrentLiabilities": ["LiabilitiesCurrent"],
+    "Inventory": ["InventoryNet"],
+    "AccountsReceivable": ["AccountsReceivableNetCurrent"],
+    "Goodwill": ["Goodwill"],
     "LongTermDebt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "SharesOutstanding": ["CommonStockSharesOutstanding"],
+    # --- Cash flow ---
     "OperatingCashFlow": ["NetCashProvidedByUsedInOperatingActivities"],
     "CapEx": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
     ],
+    "DepreciationAmort": ["DepreciationDepletionAndAmortization",
+                          "DepreciationAmortizationAndAccretionNet"],
+    "Dividends": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
+    "StockBuyback": ["PaymentsForRepurchaseOfCommonStock"],
 }
+
+
+def discover_concepts(ticker: str) -> dict[str, dict]:
+    """
+    Report, for this filer, which canonical concepts are actually reported and
+    under which XBRL tag — and which are absent. Lets the app adapt coverage per
+    company/sector instead of assuming a fixed set (a bank has no Inventory; a
+    chipmaker has no loan-loss provisions).
+    """
+    gaap = get_company_facts(ticker).get("facts", {}).get("us-gaap", {})
+    out = {}
+    for canon, aliases in CONCEPT_ALIASES.items():
+        hit = next((a for a in aliases if a in gaap), None)
+        out[canon] = {"available": hit is not None, "tag": hit}
+    return out
+
+
+def coverage_summary(ticker: str) -> dict:
+    d = discover_concepts(ticker)
+    present = [c for c, v in d.items() if v["available"]]
+    missing = [c for c, v in d.items() if not v["available"]]
+    return {"present": present, "missing": missing,
+            "coverage_pct": round(100 * len(present) / len(d), 1)}
 
 
 def extract_facts(ticker: str, concept_keys: Optional[list[str]] = None) -> list[Fact]:
@@ -292,9 +367,71 @@ def download_filing(ref: FilingRef) -> Path:
     return local
 
 
+# ---------------------------------------------------------------------------
+# Page/table-level deep links via FilingSummary.xml (R-files)
+# ---------------------------------------------------------------------------
+# Map a canonical concept to the financial STATEMENT it lives on, so we can deep
+# link to the exact table (R-file) rather than just the filing.
+_CONCEPT_TO_STATEMENT = {
+    "Revenue": "income", "CostOfRevenue": "income", "GrossProfit": "income",
+    "OperatingIncome": "income", "NetIncome": "income", "ResearchDev": "income",
+    "TotalAssets": "balance", "TotalLiabilities": "balance",
+    "StockholdersEquity": "balance", "CashAndEquivalents": "balance",
+    "LongTermDebt": "balance",
+    "OperatingCashFlow": "cash", "CapEx": "cash",
+}
+_STATEMENT_KEYWORDS = {
+    "income": ["statements of income", "statements of operations",
+               "income statement", "operations"],
+    "balance": ["balance sheet"],
+    "cash": ["cash flow"],
+}
+
+
+@lru_cache(maxsize=256)
+def statement_links(accession: str, cik: str) -> dict[str, str]:
+    """
+    Return {statement_type: url} deep-linking to the income/balance/cash-flow
+    R-file tables for a filing. Parsed from FilingSummary.xml. Cached.
+    """
+    import re
+    acc_nodash = accession.replace("-", "")
+    cik_int = str(int(cik))
+    base = f"{SEC_WWW}/Archives/edgar/data/{cik_int}/{acc_nodash}"
+    cache_key = f"fsummary_{accession}.xml"
+    try:
+        xml = _get(f"{base}/FilingSummary.xml", cache_key=cache_key, is_json=False)
+    except Exception:
+        return {}
+    reports = re.findall(
+        r"<Report[^>]*>.*?<ShortName>(.*?)</ShortName>.*?<HtmlFileName>(.*?)</HtmlFileName>",
+        xml, re.DOTALL)
+    out: dict[str, str] = {}
+    for short, html in reports:
+        s = short.lower()
+        for stype, kws in _STATEMENT_KEYWORDS.items():
+            if stype in out:
+                continue
+            if any(kw in s for kw in kws) and "parenthetic" not in s \
+                    and "(table" not in s and "(detail" not in s:
+                out[stype] = f"{base}/{html}"
+    return out
+
+
+def deep_link_for(concept: str, accession: str, ticker: str) -> Optional[str]:
+    """Deep link to the specific statement table where `concept` is reported."""
+    stype = _CONCEPT_TO_STATEMENT.get(concept)
+    if not stype:
+        return None
+    cik = resolve_cik(ticker)["cik"]
+    links = statement_links(accession, cik)
+    return links.get(stype)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    for tk in ["NVDA", "AMD", "INTC", "AVGO"]:
+    import config
+    for tk in config.active_tickers():
         info = resolve_cik(tk)
         facts = extract_facts(tk, ["Revenue", "NetIncome"])
         print(f"{tk} ({info['title']}): {len(facts)} facts; "

@@ -20,9 +20,37 @@ problem by **trust tier**:
 | **Narrative** | 10-K / 10-Q HTML (MD&A, Risk Factors) | LLM reasons over retrieved text, cites passages, never invents figures |
 
 Every figure — extracted or derived — traces to a specific **accession number**,
-fiscal year, and formula. Numeric questions are answered deterministically from
+fiscal year, formula, and (new) a **deep link to the exact financial-statement
+table** it was read from. Numeric questions are answered deterministically from
 XBRL; the LLM only phrases the result. Narrative questions must pass a grounding
 self-check or the system refuses.
+
+### Beyond the baseline (the "real points")
+- **Fully dynamic company universe** (`config.py`) — no hardcoded company list.
+  The four semiconductor names are only a seed; add any of ~10,000 SEC filers by
+  ticker from the sidebar at runtime. The agent resolves any ticker or company
+  name in a question against SEC's live filer map (try "compare Walmart and
+  Target" or "Coca-Cola vs PepsiCo"). Everything — metrics, charts, briefing,
+  conflicts — recomputes for the chosen universe.
+- **Adaptive concept discovery** (`sec_client.discover_concepts`) — the XBRL
+  CompanyFacts endpoint exposes 400–900+ tagged concepts per filer. We track a
+  broad canonical registry (~35 concepts → 15+ derived metrics: margins, ROE/ROA,
+  current ratio, R&D & SG&A intensity, asset turnover, effective tax rate, FCF,
+  capital-returned, EPS) and report per-company coverage. A bank correctly shows
+  no gross-margin/inventory metrics; a chipmaker shows all of them — coverage
+  adapts instead of assuming one sector's shape.
+- **Quant-to-narrative linkage** (`linkage.py`) — auto-detects material YoY moves
+  and retrieves the MD&A passage from that fiscal year that explains each. Plus a
+  `causal` agent route for "why did X change?" questions.
+- **Conflict taxonomy** (`conflicts.py`) — restatements, scale/units anomalies
+  (thousands-vs-actual), fiscal-year misalignment, tag switches; honest about the
+  segment-vs-consolidated boundary of the data source.
+- **Page/table deep-linking** (`sec_client.deep_link_for`) — each metric input
+  links to its specific statement R-file so a reviewer verifies in one click.
+- **Grounded executive briefing + competitive scorecard** (`briefing.py`) — a
+  one-glance "who leads, on what, by how much" across the active universe, every
+  cell traceable; answers the brief's "trust it in front of an executive?" framing.
+
 
 ---
 
@@ -49,50 +77,75 @@ self-check or the system refuses.
 ```
 
 ### Files
-- `src/sec_client.py` — SEC EDGAR client: XBRL facts (ground truth) + filing HTML, caching, rate-limiting, multi-alias tag resolution.
+- `src/sec_client.py` — SEC EDGAR client: XBRL facts (ground truth) + filing HTML, caching, rate-limiting, multi-alias tag resolution, **page/table deep-links** to the exact statement R-file per concept.
 - `src/metrics.py` — derived-metric engine with input/formula traceability and restatement-conflict detection.
 - `src/rag.py` — HTML→text, section split, chunking with citation metadata, Ollama embeddings, Chroma store/retrieve.
-- `src/agent.py` — LangGraph state machine: routing, numeric/comparative/narrative tools, grounding self-check, refusal.
-- `src/app.py` — Streamlit dashboard (4 tabs).
+- `src/agent.py` — LangGraph state machine: routing (numeric / comparative / narrative / **causal**), grounding self-check, refusal.
+- `src/linkage.py` — **quant-to-narrative linkage**: detects material metric moves and links each to the explaining MD&A passage.
+- `src/conflicts.py` — **conflict taxonomy**: restatements, scale/units anomalies, fiscal-year misalignment, tag switches (with an honest segment-vs-consolidated boundary note).
+- `src/briefing.py` — **auto-generated grounded executive briefing** + cross-company competitive scorecard.
+- `src/app.py` — Streamlit dashboard (6 tabs: Briefing · Ask · Compare · Insights · Drill-down · Data Health).
 - `src/ingest.py` — one-shot corpus builder.
-- `eval/questions.json` — labeled eval set (numeric / comparative / narrative / unanswerable).
+- `eval/questions.json` — labeled eval set (numeric / comparative / narrative / causal / unanswerable).
 - `eval/run_eval.py` — real eval runner (no mocks); reports correctness, citation accuracy, hallucination rate.
 
 ---
 
 ## Setup & run
 
-### 1. Install Ollama and pull local models
+> For full prerequisites, per-platform steps, system requirements, and a
+> troubleshooting matrix, see **[INSTALL.md](INSTALL.md)**. Requires Python 3.10+
+> (and Ollama for the Ask/Insights tabs).
+
+### Quick start — one command
+
 ```bash
-# https://ollama.com/download
-ollama pull qwen2.5:7b-instruct      # generation / reasoning (~4.7 GB)
-ollama pull nomic-embed-text         # embeddings (~274 MB)
-ollama serve                         # if not already running on :11434
+# Windows (Command Prompt or PowerShell)
+.\run.bat
+# Windows PowerShell alternative
+.\run.ps1
+
+# macOS / Linux
+make
 ```
 
-### 2. Python environment
+That's it. The launcher creates the virtualenv, installs dependencies, runs a
+preflight **doctor** (checks Python deps, Ollama, and that the models are pulled),
+builds the corpus **only if it's missing or stale**, and opens the dashboard at
+`http://localhost:8501`. Re-running is cheap — it skips everything already done.
+
+You still need Ollama + the two local models for the Ask/Insights tabs:
+
 ```bash
-python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+# https://ollama.com/download — then:
+ollama pull qwen2.5:7b-instruct
+ollama pull nomic-embed-text
+```
+
+(The numeric tabs — Briefing, Compare, Drill-down, Data Health — work without
+Ollama, straight from XBRL. If the narrative index isn't built, the app shows a
+one-click "Build narrative index now" button.)
+
+### Other commands
+
+```bash
+python run.py doctor          # environment preflight only
+python run.py ingest          # (re)build corpus, skipping what exists
+python run.py ingest --refresh  # full rebuild
+python run.py eval            # run the evaluation suite -> eval/results.json
+python run.py up              # explicit form of the default (doctor+ingest+launch)
+```
+
+### Manual (if you prefer the granular steps)
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python src/ingest.py          # build corpus (idempotent)
+streamlit run src/app.py      # launch
+python eval/run_eval.py       # evaluation
 ```
 
-### 3. Build the corpus (downloads filings + builds vector index)
-```bash
-python src/ingest.py
-```
-
-### 4. Launch the dashboard
-```bash
-streamlit run src/app.py
-```
-
-The **Compare** and **Drill-down** tabs work from cached XBRL facts even without
-Ollama. The **Ask** tab needs Ollama running.
-
-### 5. Run the evaluation
-```bash
-python eval/run_eval.py            # writes eval/results.json
-```
 
 ---
 

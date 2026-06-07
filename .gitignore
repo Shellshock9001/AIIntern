@@ -17,3 +17,4 @@ eval/results_partial*.json
 .DS_Store
 .vscode/
 .idea/
+data/compute_cache/

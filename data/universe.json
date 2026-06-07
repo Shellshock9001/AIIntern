@@ -1,0 +1,10 @@
+{
+  "tickers": [
+    "NVDA",
+    "AMD",
+    "INTC",
+    "AVGO",
+    "GOOGL"
+  ],
+  "sector": "Semiconductors"
+}

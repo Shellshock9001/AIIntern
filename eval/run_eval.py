@@ -102,6 +102,15 @@ def grade(item: dict, out: dict) -> dict:
         res["detail"] = f"expected leader {leader}; {'ok' if ok else 'mismatch'}"
         return res
 
+    if typ == "causal":
+        kw = item.get("expect_keywords", [])
+        kw_hit = sum(1 for k in kw if k.lower() in ans.lower())
+        # Causal answers must state the verified move; citation optional (needs Ollama).
+        ok = kw_hit >= max(1, len(kw) // 2)
+        res["passed"] = ok
+        res["detail"] = f"keywords {kw_hit}/{len(kw)} present in linked answer"
+        return res
+
     if typ == "narrative":
         kw = item.get("expect_keywords", [])
         kw_hit = sum(1 for k in kw if k.lower() in ans.lower())

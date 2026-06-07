@@ -123,7 +123,8 @@ def build_chunks(local_path: Path, ref) -> list[Chunk]:
     html = local_path.read_text(encoding="utf-8", errors="ignore")
     text = html_to_text(html)
     out: list[Chunk] = []
-    for section, body in split_sections(text):
+    gi = 0  # global running index across the whole filing -> guarantees unique IDs
+    for sec_idx, (section, body) in enumerate(split_sections(text)):
         for i, ch in enumerate(chunk_text(body)):
             out.append(Chunk(
                 text=ch,
@@ -133,8 +134,12 @@ def build_chunks(local_path: Path, ref) -> list[Chunk]:
                 filing_date=ref.filing_date,
                 report_date=ref.report_date,
                 section=section,
-                chunk_id=f"{ref.ticker}_{ref.accession}_{section.replace(' ', '')}_{i}",
+                # Include both the section-occurrence index and a global counter so
+                # a section header appearing more than once cannot collide.
+                chunk_id=(f"{ref.ticker}_{ref.accession}_"
+                          f"{section.replace(' ', '')}_{sec_idx}_{i}_{gi}"),
             ))
+            gi += 1
     return out
 
 
@@ -142,39 +147,117 @@ def build_chunks(local_path: Path, ref) -> list[Chunk]:
 # Ollama embeddings
 # ---------------------------------------------------------------------------
 def embed(texts: list[str], model: str = EMBED_MODEL) -> list[list[float]]:
-    """Batch embed via Ollama. Raises a clear error if Ollama isn't running."""
-    vectors = []
-    for t in texts:
-        try:
-            r = requests.post(f"{OLLAMA_URL}/api/embeddings",
-                              json={"model": model, "prompt": t}, timeout=120)
-            r.raise_for_status()
-        except requests.exceptions.ConnectionError as e:
-            raise RuntimeError(
-                "Cannot reach Ollama at localhost:11434. Start it and run "
-                f"`ollama pull {model}` first."
-            ) from e
-        vectors.append(r.json()["embedding"])
-    return vectors
+    """
+    Embed a list of texts. Tries Ollama's native batch endpoint (/api/embed,
+    one HTTP call for all texts) and falls back to parallel single-text requests.
+    The old code did one sequential request per chunk — for a filing with
+    hundreds of chunks that meant hundreds of serial round-trips (very slow).
+    """
+    if not texts:
+        return []
+    # 1) Native batch endpoint — one call for the whole list.
+    try:
+        r = requests.post(f"{OLLAMA_URL}/api/embed",
+                          json={"model": model, "input": texts}, timeout=300)
+        if r.status_code == 200:
+            data = r.json()
+            embs = data.get("embeddings")
+            if embs and len(embs) == len(texts):
+                return embs
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            "Cannot reach Ollama at localhost:11434. Start it and run "
+            f"`ollama pull {model}` first.") from e
+    except requests.exceptions.RequestException:
+        pass  # fall through to per-text path
+
+    # 2) Fallback: parallel single-text requests (older Ollama without /api/embed).
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(t):
+        r = requests.post(f"{OLLAMA_URL}/api/embeddings",
+                          json={"model": model, "prompt": t}, timeout=120)
+        r.raise_for_status()
+        return r.json()["embedding"]
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return list(ex.map(one, texts))
+    except requests.exceptions.ConnectionError as e:
+        raise RuntimeError(
+            "Cannot reach Ollama at localhost:11434. Start it and run "
+            f"`ollama pull {model}` first.") from e
 
 
 # ---------------------------------------------------------------------------
 # Chroma index
 # ---------------------------------------------------------------------------
+_CHROMA_CLIENT = None
+
+
+def _client():
+    """Singleton ChromaDB client. Creating it is expensive (~10s cold), so we do
+    it once per process rather than on every get_collection/retrieve/status call."""
+    global _CHROMA_CLIENT
+    if _CHROMA_CLIENT is None:
+        import chromadb
+        _CHROMA_CLIENT = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    return _CHROMA_CLIENT
+
+
 def get_collection(name: str = "filings"):
-    import chromadb
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    return client.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+    return _client().get_or_create_collection(
+        name=name, metadata={"hnsw:space": "cosine"})
 
 
-def index_chunks(chunks: list[Chunk], batch: int = 32) -> int:
+def corpus_status() -> dict:
+    """
+    Report what's already indexed so ingest can be idempotent. Returns total chunk
+    count and the set of (ticker, accession) filings present in the vector store.
+    """
+    try:
+        col = get_collection()
+        n = col.count()
+        if n == 0:
+            return {"chunks": 0, "tickers": set(), "filings": set()}
+        # Pull just metadata (no embeddings) to enumerate what's indexed.
+        meta = col.get(include=["metadatas"]).get("metadatas", []) or []
+        tickers = {m.get("ticker") for m in meta if m.get("ticker")}
+        filings = {(m.get("ticker"), m.get("accession")) for m in meta}
+        return {"chunks": n, "tickers": tickers, "filings": filings}
+    except Exception:
+        return {"chunks": 0, "tickers": set(), "filings": set()}
+
+
+def indexed_filings() -> set:
+    return corpus_status()["filings"]
+
+
+def index_chunks(chunks: list[Chunk], batch: int = 64, on_progress=None) -> int:
     col = get_collection()
+    # Defensive global dedup: never pass a repeated chunk_id to Chroma, even if an
+    # upstream splitter produced one. Keep first occurrence.
+    seen: set[str] = set()
+    unique: list[Chunk] = []
+    for c in chunks:
+        if c.chunk_id not in seen:
+            seen.add(c.chunk_id)
+            unique.append(c)
+    chunks = unique
+
     added = 0
+    total = len(chunks)
     for i in range(0, len(chunks), batch):
         part = chunks[i:i + batch]
-        existing = set(col.get(ids=[c.chunk_id for c in part]).get("ids", []))
+        ids = [c.chunk_id for c in part]
+        try:
+            existing = set(col.get(ids=ids).get("ids", []))
+        except Exception:
+            existing = set()
         part = [c for c in part if c.chunk_id not in existing]
         if not part:
+            if on_progress:
+                on_progress(min(i + batch, total), total)
             continue
         vecs = embed([c.text for c in part])
         col.add(
@@ -188,6 +271,8 @@ def index_chunks(chunks: list[Chunk], batch: int = 32) -> int:
             } for c in part],
         )
         added += len(part)
+        if on_progress:
+            on_progress(min(i + batch, total), total)
         log.info("Indexed %d/%d chunks", i + len(part), len(chunks))
     return added
 
@@ -223,7 +308,8 @@ if __name__ == "__main__":
     from sec_client import list_filings, download_filing
 
     total = 0
-    for tk in ["NVDA", "AMD", "INTC", "AVGO"]:
+    import config
+    for tk in config.active_tickers():
         refs = list_filings(tk, limit=4)  # ~4 filings each -> ~16 docs
         for ref in refs:
             path = download_filing(ref)

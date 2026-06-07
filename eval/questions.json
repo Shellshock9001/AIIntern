@@ -53,6 +53,16 @@
     {"id": "unans-05", "type": "unanswerable",
      "q": "How many employees does TSMC have according to these filings?",
      "expect_refusal": true,
-     "_note": "TSMC is not in the indexed corpus."}
+     "_note": "TSMC is not in the indexed corpus."},
+
+    {"id": "causal-01", "type": "causal",
+     "q": "Why did Intel's net margin fall in 2024?",
+     "expect_keywords": ["net margin", "fell", "intc"], "expect_citation": false,
+     "expect_refusal": false,
+     "_note": "Detects the FY2024 collapse from XBRL; links to MD&A when Ollama is up."},
+    {"id": "causal-02", "type": "causal",
+     "q": "What drove the change in NVDA operating margin?",
+     "expect_keywords": ["operating margin", "nvda"], "expect_citation": false,
+     "expect_refusal": false}
   ]
 }
